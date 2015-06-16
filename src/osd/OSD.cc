@@ -221,6 +221,7 @@ OSDService::OSDService(OSD *osd) :
   agent_lock("OSD::agent_lock"),
   agent_valid_iterator(false),
   agent_ops(0),
+  flush_mode_high_count(0),
   agent_active(true),
   agent_thread(this),
   agent_stop_flag(false),
@@ -537,8 +538,12 @@ void OSDService::agent_entry()
     }
     PGRef pg = *agent_queue_pos;
     int max = g_conf->osd_agent_max_ops - agent_ops;
+    int agent_flush_quota = max;
+    if (!flush_mode_high_count)
+      agent_flush_quota = g_conf->osd_agent_max_low_ops - agent_ops;
+    dout(10) << "high_count " << flush_mode_high_count << " agent_ops " << agent_ops << " flush_quota " << agent_flush_quota << dendl;
     agent_lock.Unlock();
-    if (!pg->agent_work(max)) {
+    if (!pg->agent_work(max, agent_flush_quota)) {
       dout(10) << __func__ << " " << *pg
 	<< " no agent_work, delay for " << g_conf->osd_agent_delay_time
 	<< " seconds" << dendl;
@@ -1635,9 +1640,17 @@ bool OSD::asok_command(string command, cmdmap_t& cmdmap, string format,
     store->sync_and_flush();
   } else if (command == "dump_ops_in_flight" ||
 	     command == "ops") {
-    op_tracker.dump_ops_in_flight(f);
+    if (!op_tracker.tracking_enabled) {
+      ss << "op_tracker tracking is not enabled";
+    } else {
+      op_tracker.dump_ops_in_flight(f);
+    }
   } else if (command == "dump_historic_ops") {
-    op_tracker.dump_historic_ops(f);
+    if (!op_tracker.tracking_enabled) {
+      ss << "op_tracker tracking is not enabled";
+    } else {
+      op_tracker.dump_historic_ops(f);
+    }
   } else if (command == "dump_op_pq_state") {
     f->open_object_section("pq");
     op_shardedwq.dump(f);
@@ -7867,6 +7880,7 @@ void OSD::do_recovery(PG *pg, ThreadPool::TPHandle &handle)
       pg->discover_all_missing(*rctx.query_map);
       if (rctx.query_map->empty()) {
 	dout(10) << "do_recovery  no luck, giving up on this pg for now" << dendl;
+	pg->publish_stats_to_osd();
 	recovery_wq.lock();
 	recovery_wq._dequeue(pg);
 	recovery_wq.unlock();
